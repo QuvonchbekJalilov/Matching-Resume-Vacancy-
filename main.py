@@ -719,6 +719,7 @@ SKILL_ALIASES: Dict[str, Set[str]] = {
 
 }
 
+
 # ==========================================
 # 🧠 TEXT NORMALIZATION & SKILL EXTRACTION
 # ==========================================
@@ -786,12 +787,7 @@ def is_related_title(title_a: str, title_b: str, sim: float, threshold: float = 
 # ⚡ ENCODING WITH CACHE
 # ==========================================
 def encode_texts(texts: List[str], mode: str) -> torch.Tensor:
-    """Batch encode with caching support (safe for empty input)."""
-    if not texts:
-        # Return a safe empty tensor with proper embedding dimension once model is loaded
-        emb_size = getattr(model, "get_sentence_embedding_dimension", lambda: 1024)()
-        return torch.empty((0, emb_size), device=DEVICE)
-
+    """Batch encode with caching support."""
     embeddings, to_encode, encode_map = [], [], []
     for idx, t in enumerate(texts):
         key = hashlib.md5(f"{mode}:{t}".encode()).hexdigest()
@@ -815,31 +811,24 @@ def encode_texts(texts: List[str], mode: str) -> torch.Tensor:
             VACANCY_CACHE[key] = emb
             embeddings.append(emb)
 
-    if not embeddings:
-        emb_size = getattr(model, "get_sentence_embedding_dimension", lambda: 1024)()
-        return torch.empty((0, emb_size), device=DEVICE)
-
-    # Ensure correct ordering
-    emb_dict = {
-        hashlib.md5(f"{mode}:{t}".encode()).hexdigest(): VACANCY_CACHE[
-            hashlib.md5(f"{mode}:{t}".encode()).hexdigest()
-        ]
-        for t in texts
-    }
-    embeddings = [emb_dict[hashlib.md5(f"{mode}:{t}".encode()).hexdigest()] for t in texts]
+    if len(embeddings) != len(texts):
+        # Sort back to correct order
+        emb_dict = {hashlib.md5(f"{mode}:{t}".encode()).hexdigest(): VACANCY_CACHE[hashlib.md5(f"{mode}:{t}".encode()).hexdigest()] for t in texts}
+        embeddings = [emb_dict[hashlib.md5(f"{mode}:{t}".encode()).hexdigest()] for t in texts]
 
     return torch.stack(embeddings)
-
 
 
 # ==========================================
 # 📦 MODELS
 # ==========================================
 class ResumeInput(BaseModel):
+    title: str
     description: str
 
 class VacancyInput(BaseModel):
     id: Optional[str] = None
+    title: str
     text: str
 
 class BulkMatchRequest(BaseModel):
@@ -850,6 +839,7 @@ class BulkMatchRequest(BaseModel):
     weight_embed: float = Field(0.75, ge=0.0, le=1.0)
     weight_jaccard: float = Field(0.15, ge=0.0, le=1.0)
     weight_cov: float = Field(0.10, ge=0.0, le=1.0)
+    title_threshold: float = Field(0.6, ge=0.0, le=1.0)
 
 class BulkTopItem(BaseModel):
     vacancy_id: Optional[str]
@@ -879,47 +869,52 @@ def do_bulk_match(req: BulkMatchRequest) -> dict:
     N, M = len(resumes), len(vacancies)
     assert N > 0 and M > 0, "Empty input"
 
+    # --- Stage 1: Title similarity ---
+    r_titles = [normalize_text(r.title) for r in resumes]
+    v_titles = [normalize_text(v.title) for v in vacancies]
+
+    R_titles = encode_texts(r_titles, "query")
+    V_titles = encode_texts(v_titles, "passage")
+
+    with torch.no_grad():
+        title_sims = util.cos_sim(R_titles, V_titles)
+
+    # --- Stage 2: Description match only if title similarity is high ---
     results = []
     top_k = min(req.top_k, M)
 
-    # Precompute normalized text and skills
-    r_descs = [normalize_text(r.description) for r in resumes]
-    v_texts = [normalize_text(v.text) for v in vacancies]
-
-    r_skills = precompute_skills(r_descs)
-    v_skills = precompute_skills(v_texts)
-
-    # Encode all once for efficiency
-    R = encode_texts(r_descs, "query")
-    V = encode_texts(v_texts, "passage")
-
-    with torch.no_grad():
-        sim_matrix = util.cos_sim(R, V)
-
     for i in range(N):
-        S = sim_matrix[i]
+        good_idx = []
+        for j in range(M):
+            sim = title_sims[i, j].item()
+            if is_related_title(resumes[i].title, vacancies[j].title, sim, req.title_threshold):
+                good_idx.append(j)
+
+        r_desc = normalize_text(resumes[i].description)
+        v_texts = [normalize_text(vacancies[j].text) for j in good_idx]
+
+        r_sk = precompute_skills([r_desc])[0]
+        v_sk = precompute_skills(v_texts)
+
+        R = encode_texts([r_desc], "query")
+        V = encode_texts(v_texts, "passage")
+
+        with torch.no_grad():
+            S = util.cos_sim(R, V)[0]
+
         top_vals, top_idx = torch.topk(S, min(top_k, len(v_texts)))
-
         items = []
-        for val, j in zip(top_vals.tolist(), top_idx.tolist()):
+        for val, rel_idx in zip(top_vals.tolist(), top_idx.tolist()):
+            j = good_idx[rel_idx]
             emb01 = max(0.0, min(1.0, (val + 1.0) / 2.0))
-
-            r_sk = r_skills[i]
-            v_sk = v_skills[j]
-
-            inter = sorted(r_sk & v_sk)
-            missing = sorted(v_sk - r_sk)
-            union = r_sk | v_sk
+            vsk = v_sk[rel_idx]
+            inter = sorted(r_sk & vsk)
+            missing = sorted(vsk - r_sk)
+            union = r_sk | vsk
             jaccard = len(inter) / len(union) if union else 0.0
-            coverage = len(inter) / len(v_sk) if v_sk else 0.0
-
-            final01 = (
-                req.weight_embed * emb01 +
-                req.weight_jaccard * jaccard +
-                req.weight_cov * coverage
-            )
+            coverage = len(inter) / len(vsk) if vsk else 0.0
+            final01 = req.weight_embed * emb01 + req.weight_jaccard * jaccard + req.weight_cov * coverage
             score = round(final01 * 100, 2)
-
             if score >= req.min_score:
                 items.append(BulkTopItem(
                     vacancy_id=vacancies[j].id,
@@ -931,7 +926,6 @@ def do_bulk_match(req: BulkMatchRequest) -> dict:
                     skill_matches=inter,
                     skill_missing=missing,
                 ))
-
         items.sort(key=lambda x: x.score, reverse=True)
         results.append(items)
 
