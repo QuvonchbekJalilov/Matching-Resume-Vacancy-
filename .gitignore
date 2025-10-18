@@ -8,6 +8,7 @@ __pycache__/
 venv/
 .env/
 
+
 # IDE / editor files
 .vscode/
 .idea/
@@ -15,3 +16,6 @@ venv/
 # System files
 .DS_Store
 Thumbs.db
+
+new.py
+test.py
