@@ -1078,6 +1078,7 @@ def is_related_title(title_a: str, title_b: str, sim: float, threshold: float = 
     "project management": {
         "project management", "управление проектами", "loyiha boshqaruvi",
         "project planning", "project scheduling", "project coordination",
+        "scrum master", "sprint planning", "task management", "project tracking",
         "agile", "scrum", "kanban", "waterfall", "pmi", "pmp", "prince2",
         "jira", "trello", "asana", "risk management", "timeline tracking",
         "milestone", "deliverables", "project charter", "stakeholder management",
