@@ -13,7 +13,7 @@ MODEL_NAME = os.getenv("MODEL_NAME", "BAAI/bge-m3")
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 torch.set_num_threads(os.cpu_count())
 
-app = FastAPI(title="Resume-Vacancy Matcher API (v5 Ultra-Fast)")
+app = FastAPI(title="Resume-Vacancy Matcher API (v5 Ultra-Fast new edition)")
 executor = ThreadPoolExecutor(max_workers=min(8, os.cpu_count() or 4))
 
 model: SentenceTransformer = None
