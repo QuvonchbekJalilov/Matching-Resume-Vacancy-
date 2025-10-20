@@ -1,4 +1,4 @@
-import os, re, hashlib, asyncio
+import os, re, hashlib, asyncio, gc
 from concurrent.futures import ThreadPoolExecutor
 from typing import List, Dict, Set, Optional
 import torch
@@ -853,7 +853,7 @@ def is_related_title(title_a: str, title_b: str, sim: float, threshold: float = 
 # ⚡ ENCODING WITH CACHE
 # ==========================================
 def encode_texts(texts: List[str], mode: str) -> torch.Tensor:
-    """Batch encode with caching support."""
+    """Batch encode with caching + safe memory management."""
     embeddings, to_encode, encode_map = [], [], []
     for idx, t in enumerate(texts):
         key = hashlib.md5(f"{mode}:{t}".encode()).hexdigest()
@@ -863,26 +863,27 @@ def encode_texts(texts: List[str], mode: str) -> torch.Tensor:
             to_encode.append(t)
             encode_map.append((idx, key))
 
-    if to_encode:
-        prefix = "query: " if "e5" in MODEL_NAME.lower() and mode == "query" else \
-                 "passage: " if "e5" in MODEL_NAME.lower() and mode == "passage" else ""
-        new_embs = model.encode(
-            [prefix + t for t in to_encode],
-            convert_to_tensor=True,
-            normalize_embeddings=True,
-            device=DEVICE,
-            batch_size=32,
-        )
-        for (idx, key), emb in zip(encode_map, new_embs):
-            VACANCY_CACHE[key] = emb
-            embeddings.append(emb)
+    with torch.no_grad():
+        if to_encode:
+            prefix = (
+                "query: " if "e5" in MODEL_NAME.lower() and mode == "query" else
+                "passage: " if "e5" in MODEL_NAME.lower() and mode == "passage" else ""
+            )
+            new_embs = model.encode(
+                [prefix + t for t in to_encode],
+                convert_to_tensor=True,
+                normalize_embeddings=True,
+                device=DEVICE,
+                batch_size=32,
+            )
+            for (idx, key), emb in zip(encode_map, new_embs):
+                VACANCY_CACHE[key] = emb.detach().cpu()  # store CPU copy to save VRAM
+                embeddings.append(VACANCY_CACHE[key])
 
-    if len(embeddings) != len(texts):
-        # Sort back to correct order
-        emb_dict = {hashlib.md5(f"{mode}:{t}".encode()).hexdigest(): VACANCY_CACHE[hashlib.md5(f"{mode}:{t}".encode()).hexdigest()] for t in texts}
-        embeddings = [emb_dict[hashlib.md5(f"{mode}:{t}".encode()).hexdigest()] for t in texts]
+    # Collect all embeddings from cache (CPU tensors)
+    final = [VACANCY_CACHE[hashlib.md5(f"{mode}:{t}".encode()).hexdigest()] for t in texts]
+    return torch.stack(final).to(DEVICE)  # move to GPU only when needed
 
-    return torch.stack(embeddings)
 
 
 # ==========================================
@@ -926,71 +927,64 @@ class BulkMatchResponse(BaseModel):
 # ==========================================
 # 🚀 CORE MATCH FUNCTION
 # ==========================================
-def do_bulk_match(req: BulkMatchRequest) -> dict:
-    resumes = req.resumes
-    vacancies = req.vacancies
-    N, M = len(resumes), len(vacancies)
-    assert N > 0 and M > 0, "Empty input"
-
-    # --- Normalize texts ---
+def do_bulk_match(req):
+    resumes, vacancies = req.resumes, req.vacancies
     r_texts = [normalize_text(r.description) for r in resumes]
     v_texts = [normalize_text(v.text) for v in vacancies]
 
-    # --- Precompute skills ---
     R_skills = precompute_skills(r_texts)
     V_skills = precompute_skills(v_texts)
 
-    # --- Encode all (embedding-based similarity) ---
-    R = encode_texts(r_texts, "query")
-    V = encode_texts(v_texts, "passage")
-
     with torch.no_grad():
-        S = util.cos_sim(R, V)  # shape (N, M)
+        R = encode_texts(r_texts, "query")
+        V = encode_texts(v_texts, "passage")
+        S = util.cos_sim(R, V).cpu()  # immediately move to CPU to free GPU
+
+    torch.cuda.empty_cache()  # ⚙️ clear freed tensors
 
     results = []
-    top_k = min(req.top_k, M)
+    top_k = min(req.top_k, len(vacancies))
 
-    # --- Rank and score ---
-    for i in range(N):
-        top_vals, top_idx = torch.topk(S[i], top_k)
+    for i in range(len(resumes)):
+        sims = S[i]
+        top_vals, top_idx = torch.topk(sims, top_k)
         items = []
+
         for val, j in zip(top_vals.tolist(), top_idx.tolist()):
             emb01 = max(0.0, min(1.0, (val + 1.0) / 2.0))
-
             r_sk, v_sk = R_skills[i], V_skills[j]
-            inter = sorted(r_sk & v_sk)
-            missing = sorted(v_sk - r_sk)
+            inter, missing = sorted(r_sk & v_sk), sorted(v_sk - r_sk)
             union = r_sk | v_sk
             jaccard = len(inter) / len(union) if union else 0.0
             coverage = len(inter) / len(v_sk) if v_sk else 0.0
-
-            final01 = (
+            score = round(
                 req.weight_embed * emb01 +
                 req.weight_jaccard * jaccard +
-                req.weight_cov * coverage
-            )
-            score = round(final01 * 100, 2)
-
+                req.weight_cov * coverage, 4
+            ) * 100
             if score >= req.min_score:
-                items.append(BulkTopItem(
-                    vacancy_id=vacancies[j].id,
-                    vacancy_index=j,
-                    score=score,
-                    embedding_score=round(emb01 * 100, 2),
-                    skills_jaccard=round(jaccard * 100, 2),
-                    keyword_coverage=round(coverage * 100, 2),
-                    skill_matches=inter,
-                    skill_missing=missing,
-                ))
+                items.append({
+                    "vacancy_id": vacancies[j].id,
+                    "vacancy_index": j,
+                    "score": score,
+                    "embedding_score": round(emb01 * 100, 2),
+                    "skills_jaccard": round(jaccard * 100, 2),
+                    "keyword_coverage": round(coverage * 100, 2),
+                    "skill_matches": inter,
+                    "skill_missing": missing,
+                })
+        results.append(sorted(items, key=lambda x: x["score"], reverse=True))
 
-        items.sort(key=lambda x: x.score, reverse=True)
-        results.append(items)
+    # 🧹 GPU + RAM cleanup
+    del R, V, S
+    torch.cuda.empty_cache()
+    gc.collect()
 
     return {
         "model": MODEL_NAME,
         "device": DEVICE,
-        "resumes": N,
-        "vacancies": M,
+        "resumes": len(resumes),
+        "vacancies": len(vacancies),
         "top_k": top_k,
         "results": results,
     }
